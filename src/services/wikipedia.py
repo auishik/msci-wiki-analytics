@@ -2,19 +2,18 @@ import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass, field
 from urllib.parse import unquote
 
 import httpx
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
 
 from src.exceptions import WikipediaAPIError, WikipediaParseError
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class PageContent:
+class PageContent(BaseModel):
     """Content extracted from a Wikipedia page."""
 
     title: str
@@ -22,12 +21,11 @@ class PageContent:
     links: list[str]
 
 
-@dataclass
-class TraversalResult:
+class TraversalResult(BaseModel):
     """Result of traversing Wikipedia articles."""
 
-    texts: list[str] = field(default_factory=list)
-    visited: set[str] = field(default_factory=set)
+    texts: list[str] = Field(default_factory=list)
+    visited: set[str] = Field(default_factory=set)
 
 
 class WikiRecursiveFetchService:
