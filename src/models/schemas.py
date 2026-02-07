@@ -28,5 +28,5 @@ class KeywordsRequest(BaseModel):
     depth: int = Field(ge=0, description="The depth of traversal")
     ignore_list: list[str] = Field(description="List of words to ignore")
     percentile: int = Field(
-        ge=0, le=100, description="Percentile threshold for word frequency"
+        ge=0, lt=100, description="Percentile threshold for word frequency"
     )
