@@ -39,6 +39,23 @@ class WikipediaAPIError(WikipediaFetchError):
         self.status_code = status_code
 
 
+class RecoverableAPIError(WikipediaAPIError):
+    """Raised for transient API errors that can be retried.
+
+    Includes 429 rate limiting, timeouts, and connection errors.
+    """
+
+    def __init__(
+        self,
+        message: str = "Recoverable API error",
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(message, status_code, cause)
+        self.retry_after = retry_after
+
+
 class WikipediaParseError(WikipediaFetchError):
     """Raised when unable to parse Wikipedia API response."""
 
