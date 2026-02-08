@@ -379,3 +379,107 @@ class TestRetryBehavior:
             await service.fetch_page("Test")
 
         assert mock_client.get.call_count == 1
+
+
+class TestErrorCollection:
+    @pytest.fixture
+    def mock_client(self) -> AsyncMock:
+        return AsyncMock(spec=httpx.AsyncClient)
+
+    @pytest.fixture
+    def settings(self) -> Settings:
+        return Settings(
+            retry_max_attempts=1,
+            retry_min_wait=0.01,
+            retry_max_wait=0.01,
+        )
+
+    @pytest.fixture
+    def service(
+        self, mock_client: AsyncMock, settings: Settings
+    ) -> WikiRecursiveFetchService:
+        return WikiRecursiveFetchService(client=mock_client, settings=settings)
+
+    @pytest.mark.asyncio
+    async def test_traverse_collects_errors_and_continues(
+        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+    ) -> None:
+        responses = {
+            "A": make_wiki_response(
+                title="A",
+                html="<p>A content</p>",
+                links=[make_link("B"), make_link("C")],
+            ),
+            "C": make_wiki_response(
+                title="C",
+                html="<p>C content</p>",
+                links=[],
+            ),
+        }
+
+        async def get_response(url: str, params: dict) -> MagicMock:
+            title = params["page"]
+            if title == "B":
+                raise httpx.TimeoutException("timeout")
+            json_data = responses.get(title, {"error": {"code": "missingtitle"}})
+            return make_mock_response(json_data)
+
+        mock_client.get.side_effect = get_response
+
+        result = await service.traverse("A", depth=1)
+
+        assert len(result.texts) == 2  # A and C succeeded
+        assert len(result.errors) == 1  # B failed
+        assert result.errors[0].title == "B"
+        assert "Timeout" in result.errors[0].error
+
+    @pytest.mark.asyncio
+    async def test_traverse_returns_partial_results_on_errors(
+        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+    ) -> None:
+        responses = {
+            "A": make_wiki_response(
+                title="A",
+                html="<p>A content</p>",
+                links=[make_link("B"), make_link("C"), make_link("D")],
+            ),
+            "B": make_wiki_response(
+                title="B",
+                html="<p>B content</p>",
+                links=[],
+            ),
+        }
+
+        async def get_response(url: str, params: dict) -> MagicMock:
+            title = params["page"]
+            if title in ("C", "D"):
+                raise httpx.ConnectError("connection failed")
+            json_data = responses.get(title, {"error": {"code": "missingtitle"}})
+            return make_mock_response(json_data)
+
+        mock_client.get.side_effect = get_response
+
+        result = await service.traverse("A", depth=1)
+
+        assert len(result.texts) == 2  # A and B succeeded
+        assert len(result.errors) == 2  # C and D failed
+        error_titles = {e.title for e in result.errors}
+        assert error_titles == {"C", "D"}
+
+    @pytest.mark.asyncio
+    async def test_traverse_empty_errors_on_success(
+        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+    ) -> None:
+        mock_response = make_mock_response(
+            make_wiki_response(
+                title="A",
+                html="<p>A content</p>",
+                links=[],
+            )
+        )
+        mock_client.get.return_value = mock_response
+
+        result = await service.traverse("A", depth=0)
+
+        assert len(result.texts) == 1
+        assert len(result.errors) == 0

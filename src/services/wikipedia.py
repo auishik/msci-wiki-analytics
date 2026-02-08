@@ -19,7 +19,12 @@ from tenacity import (
 )
 
 from src.config import Settings, get_settings
-from src.exceptions import RecoverableAPIError, WikipediaAPIError, WikipediaParseError
+from src.exceptions import (
+    RecoverableAPIError,
+    WikipediaAPIError,
+    WikipediaFetchError,
+    WikipediaParseError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +37,19 @@ class PageContent(BaseModel):
     links: list[str]
 
 
+class TraversalError(BaseModel):
+    """Error encountered while traversing a Wikipedia article."""
+
+    title: str
+    error: str
+
+
 class TraversalResult(BaseModel):
     """Result of traversing Wikipedia articles."""
 
     texts: list[str] = Field(default_factory=list)
     visited: set[str] = Field(default_factory=set)
+    errors: list[TraversalError] = Field(default_factory=list)
 
 
 def _create_retry_wait(settings: Settings) -> "RetryAfterWait":
@@ -284,9 +297,10 @@ class WikiRecursiveFetchService:
         result = TraversalResult()
         await self._traverse_recursive(title, depth, result)
         logger.info(
-            "Traversal complete: %d articles fetched, %d total visited",
+            "Traversal complete: %d articles fetched, %d visited, %d errors",
             len(result.texts),
             len(result.visited),
+            len(result.errors),
         )
         return result
 
@@ -304,7 +318,13 @@ class WikiRecursiveFetchService:
 
         result.visited.add(normalized_title)
 
-        page = await self.fetch_page(title)
+        try:
+            page = await self.fetch_page(title)
+        except WikipediaFetchError as e:
+            logger.warning("Failed to fetch '%s': %s", title, e)
+            result.errors.append(TraversalError(title=title, error=str(e)))
+            return
+
         if page is None:
             return
 
