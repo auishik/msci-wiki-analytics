@@ -47,6 +47,9 @@ class PageContent(BaseModel):
     title: str
     text: str
     links: list[str]
+    redirects: list[str] = Field(default_factory=list)
+    """Titles that redirect to this page (e.g., if 'UK' redirects to 'United Kingdom',
+    redirects would contain 'UK')."""
 
 
 class TraversalError(BaseModel):
@@ -135,8 +138,15 @@ class WikiRecursiveFetchService:
         h1 = soup.find("h1", {"id": "firstHeading"})
         page_title = h1.get_text(strip=True) if isinstance(h1, Tag) else title
 
-        # Scope to the parser-output content div
-        content_div = soup.find("div", class_="mw-parser-output")
+        # Scope to the parser-output content div inside mw-content-text
+        # We must scope to #mw-content-text first because there may be multiple
+        # mw-parser-output divs on the page (e.g., coordinates, empty divs)
+        mw_content_text = soup.find("div", id="mw-content-text")
+        if not isinstance(mw_content_text, Tag):
+            logger.warning("No mw-content-text div found for page: %s", title)
+            return None
+
+        content_div = mw_content_text.find("div", class_="mw-parser-output")
         if not isinstance(content_div, Tag):
             logger.warning("No content div found for page: %s", title)
             return None
@@ -163,16 +173,21 @@ class WikiRecursiveFetchService:
         text = content_div.get_text(separator=" ", strip=True)
         text = self._clean_text(text)
 
+        # Extract redirect source from page's JavaScript config
+        redirects = self._extract_redirects_from_html(html)
+
         logger.debug(
-            "Fetched page '%s' (HTML): %d chars, %d links",
+            "Fetched page '%s' (HTML): %d chars, %d links, %d redirects",
             page_title,
             len(text),
             len(links),
+            len(redirects),
         )
         return PageContent(
             title=page_title,
             text=text,
             links=links,
+            redirects=redirects,
         )
 
     def _extract_links_from_html(self, content_div: Tag) -> list[str]:
@@ -208,6 +223,28 @@ class WikiRecursiveFetchService:
                 links.append(title)
 
         return links
+
+    def _extract_redirects_from_html(self, html: str) -> list[str]:
+        """Extract redirect source from HTML page config (wgRedirectedFrom).
+
+        Wikipedia handles article redirects internally (not via HTTP 301/302),
+        embedding the original title in the page's JavaScript config.
+        """
+        redirects: list[str] = []
+
+        # Look for wgRedirectedFrom in the JavaScript config
+        # Format: "wgRedirectedFrom":"UK"
+        match = re.search(r'"wgRedirectedFrom"\s*:\s*"([^"]+)"', html)
+        if match:
+            redirect_from = match.group(1)
+            # Unescape any JSON string escapes
+            try:
+                redirect_from = json.loads(f'"{redirect_from}"')
+            except json.JSONDecodeError:
+                pass
+            redirects.append(redirect_from)
+
+        return redirects
 
     # ------------------------------------------------------------------
     # API client path (MediaWiki API /w/api.php)
@@ -267,16 +304,25 @@ class WikiRecursiveFetchService:
                 f"Failed to parse links for '{title}'", cause=e
             ) from e
 
+        # Extract redirect sources (titles that redirect to this page)
+        redirects: list[str] = []
+        raw_redirects = parse_data.get("redirects", [])
+        for redirect in raw_redirects:
+            if "from" in redirect:
+                redirects.append(redirect["from"])
+
         logger.debug(
-            "Fetched page '%s' (API): %d chars, %d links",
+            "Fetched page '%s' (API): %d chars, %d links, %d redirects",
             title,
             len(text),
             len(links),
+            len(redirects),
         )
         return PageContent(
             title=parse_data.get("title", title),
             text=text,
             links=links,
+            redirects=redirects,
         )
 
     def _clean_text(self, text: str) -> str:
@@ -347,6 +393,12 @@ class WikiRecursiveFetchService:
 
         if page is None:
             return
+
+        # Add the resolved page title and any redirects to visited set
+        # This prevents re-fetching the same page via different aliases
+        result.visited.add(self._normalize_title(page.title))
+        for redirect in page.redirects:
+            result.visited.add(self._normalize_title(redirect))
 
         result.texts.append(page.text)
 
