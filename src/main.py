@@ -1,4 +1,3 @@
-import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -6,15 +5,17 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from src.exceptions import WikipediaAPIError, WikipediaParseError
+from src.logging import get_logger, setup_logging
 from src.models.schemas import HealthResponse, KeywordsRequest, WordFrequencyResponse
 from src.services.frequency import WordFrequencyService
-from src.services.wiki_client import WikipediaAPIClient
+from src.services.wiki_html_client import WikiHTMLClient
 from src.services.wikipedia import WikiRecursiveFetchService
 
-logger = logging.getLogger(__name__)
+setup_logging()
+logger = get_logger(__name__)
 
 # Service instances
-api_client: WikipediaAPIClient | None = None
+html_client: WikiHTMLClient | None = None
 wiki_service: WikiRecursiveFetchService | None = None
 frequency_service: WordFrequencyService | None = None
 
@@ -22,14 +23,14 @@ frequency_service: WordFrequencyService | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan - startup and shutdown."""
-    global api_client, wiki_service, frequency_service
-    api_client = WikipediaAPIClient()
-    wiki_service = WikiRecursiveFetchService(api_client=api_client)
+    global html_client, wiki_service, frequency_service
+    html_client = WikiHTMLClient()
+    wiki_service = WikiRecursiveFetchService(html_client=html_client)
     frequency_service = WordFrequencyService()
     logger.info("Services initialized")
     yield
-    if api_client:
-        await api_client.close()
+    if html_client:
+        await html_client.close()
     logger.info("Services shut down")
 
 

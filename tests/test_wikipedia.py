@@ -5,6 +5,7 @@ import pytest
 from src.config import Settings
 from src.exceptions import RecoverableAPIError, WikipediaAPIError
 from src.services.wiki_client import WikipediaAPIClient
+from src.services.wiki_html_client import WikiHTMLClient
 from src.services.wikipedia import WikiRecursiveFetchService
 
 
@@ -350,3 +351,196 @@ class TestErrorCollection:
 
         assert len(result.texts) == 1
         assert len(result.errors) == 0
+
+
+# ------------------------------------------------------------------
+# Tests for the HTML client path
+# ------------------------------------------------------------------
+
+
+def make_wiki_html_page(
+    title: str,
+    body_html: str,
+    link_titles: list[str] | None = None,
+) -> str:
+    """Build a minimal Wikipedia-like HTML page for testing."""
+    links_html = ""
+    if link_titles:
+        links_html = " ".join(
+            f'<a href="/wiki/{t.replace(" ", "_")}">{t}</a>' for t in link_titles
+        )
+    return (
+        f"<html><head><title>{title}</title></head>"
+        f'<body><h1 id="firstHeading">{title}</h1>'
+        f'<div id="mw-content-text"><div class="mw-parser-output">'
+        f"{body_html} {links_html}"
+        f"</div></div></body></html>"
+    )
+
+
+def make_html_mock_response(html: str, status_code: int = 200) -> MagicMock:
+    """Create a mock HTTP response carrying HTML text."""
+    mock = MagicMock()
+    mock.status_code = status_code
+    mock.text = html
+    return mock
+
+
+class TestHTMLFetchPath:
+    @pytest.fixture
+    def mock_html_client(self) -> AsyncMock:
+        return AsyncMock(spec=WikiHTMLClient)
+
+    @pytest.fixture
+    def service(self, mock_html_client: AsyncMock) -> WikiRecursiveFetchService:
+        return WikiRecursiveFetchService(html_client=mock_html_client)
+
+    @pytest.mark.asyncio
+    async def test_fetch_page_html_returns_content(
+        self, service: WikiRecursiveFetchService, mock_html_client: AsyncMock
+    ) -> None:
+        page_html = make_wiki_html_page(
+            title="Python",
+            body_html="<p>Python is a programming language.</p>",
+            link_titles=["Java", "Ruby"],
+        )
+        mock_html_client.get.return_value = make_html_mock_response(page_html)
+
+        result = await service.fetch_page("Python")
+
+        assert result is not None
+        assert result.title == "Python"
+        assert "Python is a programming language" in result.text
+        assert "Java" in result.links
+        assert "Ruby" in result.links
+
+    @pytest.mark.asyncio
+    async def test_fetch_page_html_returns_none_on_404(
+        self, service: WikiRecursiveFetchService, mock_html_client: AsyncMock
+    ) -> None:
+        mock_html_client.get.side_effect = WikipediaAPIError(
+            "HTTP 404 for 'Nonexistent'", status_code=404
+        )
+
+        result = await service.fetch_page("Nonexistent")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_fetch_page_html_skips_namespace_links(
+        self, service: WikiRecursiveFetchService, mock_html_client: AsyncMock
+    ) -> None:
+        page_html = (
+            '<html><body><h1 id="firstHeading">Test</h1>'
+            '<div id="mw-content-text"><div class="mw-parser-output">'
+            "<p>Content</p>"
+            '<a href="/wiki/Article">Article</a>'
+            '<a href="/wiki/File:Image.png">Image</a>'
+            '<a href="/wiki/Wikipedia:About">About</a>'
+            '<a href="/wiki/Help:Contents">Help</a>'
+            "</div></div></body></html>"
+        )
+        mock_html_client.get.return_value = make_html_mock_response(page_html)
+
+        result = await service.fetch_page("Test")
+
+        assert result is not None
+        assert result.links == ["Article"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_page_html_deduplicates_links(
+        self, service: WikiRecursiveFetchService, mock_html_client: AsyncMock
+    ) -> None:
+        page_html = (
+            '<html><body><h1 id="firstHeading">Test</h1>'
+            '<div id="mw-content-text"><div class="mw-parser-output">'
+            "<p>Content</p>"
+            '<a href="/wiki/Python">Python</a>'
+            '<a href="/wiki/Python#History">Python history</a>'
+            '<a href="/wiki/python">python</a>'
+            "</div></div></body></html>"
+        )
+        mock_html_client.get.return_value = make_html_mock_response(page_html)
+
+        result = await service.fetch_page("Test")
+
+        assert result is not None
+        # All three links refer to the same article
+        assert len(result.links) == 1
+        assert result.links[0] == "Python"
+
+    @pytest.mark.asyncio
+    async def test_fetch_page_html_strips_fragments(
+        self, service: WikiRecursiveFetchService, mock_html_client: AsyncMock
+    ) -> None:
+        page_html = (
+            '<html><body><h1 id="firstHeading">Test</h1>'
+            '<div id="mw-content-text"><div class="mw-parser-output">'
+            "<p>Content</p>"
+            '<a href="/wiki/Java#Syntax">Java</a>'
+            "</div></div></body></html>"
+        )
+        mock_html_client.get.return_value = make_html_mock_response(page_html)
+
+        result = await service.fetch_page("Test")
+
+        assert result is not None
+        assert result.links == ["Java"]
+
+    @pytest.mark.asyncio
+    async def test_traverse_with_html_client(
+        self, service: WikiRecursiveFetchService, mock_html_client: AsyncMock
+    ) -> None:
+        pages = {
+            "Python": make_wiki_html_page(
+                title="Python",
+                body_html="<p>Python content</p>",
+                link_titles=["Java"],
+            ),
+            "Java": make_wiki_html_page(
+                title="Java",
+                body_html="<p>Java content</p>",
+            ),
+        }
+
+        async def get_html(title: str) -> MagicMock:
+            if title in pages:
+                return make_html_mock_response(pages[title])
+            raise WikipediaAPIError(f"HTTP 404 for '{title}'", status_code=404)
+
+        mock_html_client.get.side_effect = get_html
+
+        result = await service.traverse("Python", depth=1)
+
+        assert len(result.texts) == 2
+        assert "python" in result.visited
+        assert "java" in result.visited
+
+    @pytest.mark.asyncio
+    async def test_fetch_page_html_removes_tables(
+        self, service: WikiRecursiveFetchService, mock_html_client: AsyncMock
+    ) -> None:
+        page_html = make_wiki_html_page(
+            title="Test",
+            body_html=(
+                "<p>Visible content.</p>" "<table><tr><td>Table data</td></tr></table>"
+            ),
+        )
+        mock_html_client.get.return_value = make_html_mock_response(page_html)
+
+        result = await service.fetch_page("Test")
+
+        assert result is not None
+        assert "Visible content" in result.text
+        assert "Table data" not in result.text
+
+    @pytest.mark.asyncio
+    async def test_fetch_page_html_reraises_non_404_errors(
+        self, service: WikiRecursiveFetchService, mock_html_client: AsyncMock
+    ) -> None:
+        mock_html_client.get.side_effect = RecoverableAPIError(
+            "Timeout for 'Test'", status_code=None
+        )
+
+        with pytest.raises(RecoverableAPIError, match="Timeout"):
+            await service.fetch_page("Test")
