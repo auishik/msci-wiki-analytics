@@ -1,30 +1,17 @@
 import asyncio
 import json
 import logging
-import random
 import re
 from functools import partial
 from urllib.parse import unquote
 
 import aiometer
-import httpx
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
-from tenacity import (
-    RetryCallState,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 from src.config import Settings, get_settings
-from src.exceptions import (
-    RecoverableAPIError,
-    WikipediaAPIError,
-    WikipediaFetchError,
-    WikipediaParseError,
-)
+from src.exceptions import WikipediaFetchError, WikipediaParseError
+from src.services.wiki_client import WikipediaAPIClient
 
 logger = logging.getLogger(__name__)
 
@@ -52,66 +39,22 @@ class TraversalResult(BaseModel):
     errors: list[TraversalError] = Field(default_factory=list)
 
 
-def _create_retry_wait(settings: Settings) -> "RetryAfterWait":
-    """Create a wait strategy that respects Retry-After header."""
-    return RetryAfterWait(settings)
-
-
-class RetryAfterWait:
-    """Custom wait strategy that uses Retry-After header if available."""
-
-    def __init__(self, settings: Settings) -> None:
-        self._settings = settings
-        self._exponential = wait_exponential(
-            multiplier=settings.retry_multiplier,
-            min=settings.retry_min_wait,
-            max=settings.retry_max_wait,
-        )
-
-    def __call__(self, retry_state: RetryCallState) -> float:
-        exc = retry_state.outcome.exception() if retry_state.outcome else None
-        if isinstance(exc, RecoverableAPIError) and exc.retry_after is not None:
-            jitter = random.uniform(0, self._settings.retry_jitter_max)
-            return exc.retry_after + jitter
-        wait_time: float = self._exponential(retry_state)
-        return wait_time
-
-
 class WikiRecursiveFetchService:
     """Service for fetching and recursively traversing Wikipedia articles."""
 
-    BASE_URL = "https://en.wikipedia.org/w/api.php"
-
     def __init__(
         self,
-        client: httpx.AsyncClient | None = None,
+        api_client: WikipediaAPIClient | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._settings = settings or get_settings()
-        self._client = client
-        self._owns_client = client is None
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                headers={
-                    "User-Agent": self._settings.wiki_user_agent,
-                    "Api-User-Agent": self._settings.wiki_user_agent,
-                },
-                timeout=httpx.Timeout(
-                    connect=self._settings.timeout_connect,
-                    read=self._settings.timeout_read,
-                    write=self._settings.timeout_write,
-                    pool=self._settings.timeout_pool,
-                ),
-            )
-        return self._client
+        self._api_client = api_client or WikipediaAPIClient(settings=self._settings)
+        self._owns_client = api_client is None
 
     async def close(self) -> None:
-        """Close the HTTP client if we own it."""
-        if self._owns_client and self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        """Close the API client if we own it."""
+        if self._owns_client:
+            await self._api_client.close()
 
     async def fetch_page(self, title: str) -> PageContent | None:
         """
@@ -137,7 +80,7 @@ class WikiRecursiveFetchService:
             "redirects": "1",
         }
 
-        response = await self._fetch_with_retry(title, params)
+        response = await self._api_client.get(params)
 
         try:
             data = response.json()
@@ -189,83 +132,6 @@ class WikiRecursiveFetchService:
             text=text,
             links=links,
         )
-
-    async def _fetch_with_retry(
-        self, title: str, params: dict[str, str]
-    ) -> httpx.Response:
-        """Fetch a page with retry logic for recoverable errors."""
-        retrying = retry(
-            retry=retry_if_exception_type(RecoverableAPIError),
-            stop=stop_after_attempt(self._settings.retry_max_attempts),
-            wait=_create_retry_wait(self._settings),
-            reraise=True,
-        )
-
-        @retrying
-        async def _do_fetch() -> httpx.Response:
-            return await self._make_request(title, params)
-
-        return await _do_fetch()
-
-    async def _make_request(self, title: str, params: dict[str, str]) -> httpx.Response:
-        """Make a single HTTP request, raising appropriate exceptions."""
-        client = await self._get_client()
-
-        try:
-            response = await client.get(self.BASE_URL, params=params)
-        except httpx.TimeoutException as e:
-            logger.warning("Timeout fetching page '%s': %s", title, e)
-            raise RecoverableAPIError(
-                f"Timeout fetching page '{title}'", cause=e
-            ) from e
-        except httpx.ConnectError as e:
-            logger.warning("Connection error fetching page '%s': %s", title, e)
-            raise RecoverableAPIError(
-                f"Connection failed for '{title}'", cause=e
-            ) from e
-        except httpx.RequestError as e:
-            logger.error("Request error fetching page '%s': %s", title, e)
-            raise WikipediaAPIError(f"Request failed for '{title}'", cause=e) from e
-
-        if response.status_code == 429:
-            retry_after = self._parse_retry_after(response)
-            logger.warning(
-                "Rate limited fetching '%s', retry-after: %s", title, retry_after
-            )
-            raise RecoverableAPIError(
-                f"Rate limited while fetching '{title}'",
-                status_code=429,
-                retry_after=retry_after,
-            )
-
-        if response.status_code >= 500:
-            logger.warning("Server error %d fetching '%s'", response.status_code, title)
-            raise RecoverableAPIError(
-                f"Server error {response.status_code} fetching '{title}'",
-                status_code=response.status_code,
-            )
-
-        if response.status_code >= 400:
-            logger.error(
-                "HTTP error %d fetching page '%s'", response.status_code, title
-            )
-            raise WikipediaAPIError(
-                f"HTTP {response.status_code} fetching '{title}'",
-                status_code=response.status_code,
-            )
-
-        return response
-
-    def _parse_retry_after(self, response: httpx.Response) -> float | None:
-        """Parse Retry-After header value."""
-        retry_after = response.headers.get("Retry-After")
-        if retry_after is None:
-            return None
-        try:
-            return float(retry_after)
-        except ValueError:
-            logger.warning("Could not parse Retry-After header: %s", retry_after)
-            return None
 
     def _clean_text(self, text: str) -> str:
         """Clean extracted text by removing extra whitespace."""

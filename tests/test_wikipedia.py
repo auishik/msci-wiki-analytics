@@ -1,9 +1,10 @@
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
 
 from src.config import Settings
+from src.exceptions import RecoverableAPIError, WikipediaAPIError
+from src.services.wiki_client import WikipediaAPIClient
 from src.services.wikipedia import WikiRecursiveFetchService
 
 
@@ -37,17 +38,17 @@ def make_mock_response(json_data: dict, status_code: int = 200) -> MagicMock:
 
 class TestWikiRecursiveFetchService:
     @pytest.fixture
-    def mock_client(self) -> AsyncMock:
-        return AsyncMock(spec=httpx.AsyncClient)
+    def mock_api_client(self) -> AsyncMock:
+        return AsyncMock(spec=WikipediaAPIClient)
 
     @pytest.fixture
-    def service(self, mock_client: AsyncMock) -> WikiRecursiveFetchService:
-        service = WikiRecursiveFetchService(client=mock_client)
+    def service(self, mock_api_client: AsyncMock) -> WikiRecursiveFetchService:
+        service = WikiRecursiveFetchService(api_client=mock_api_client)
         return service
 
     @pytest.mark.asyncio
     async def test_fetch_page_returns_content(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         mock_response = make_mock_response(
             make_wiki_response(
@@ -56,7 +57,7 @@ class TestWikiRecursiveFetchService:
                 links=[make_link("Java"), make_link("Ruby")],
             )
         )
-        mock_client.get.return_value = mock_response
+        mock_api_client.get.return_value = mock_response
 
         result = await service.fetch_page("Python")
 
@@ -67,10 +68,10 @@ class TestWikiRecursiveFetchService:
 
     @pytest.mark.asyncio
     async def test_fetch_page_returns_none_on_error(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         mock_response = make_mock_response({"error": {"code": "missingtitle"}})
-        mock_client.get.return_value = mock_response
+        mock_api_client.get.return_value = mock_response
 
         result = await service.fetch_page("NonexistentPage12345")
 
@@ -78,7 +79,7 @@ class TestWikiRecursiveFetchService:
 
     @pytest.mark.asyncio
     async def test_fetch_page_filters_non_article_links(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         mock_response = make_mock_response(
             make_wiki_response(
@@ -91,7 +92,7 @@ class TestWikiRecursiveFetchService:
                 ],
             )
         )
-        mock_client.get.return_value = mock_response
+        mock_api_client.get.return_value = mock_response
 
         result = await service.fetch_page("Test")
 
@@ -100,7 +101,7 @@ class TestWikiRecursiveFetchService:
 
     @pytest.mark.asyncio
     async def test_traverse_depth_zero_returns_single_article(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         mock_response = make_mock_response(
             make_wiki_response(
@@ -109,18 +110,18 @@ class TestWikiRecursiveFetchService:
                 links=[make_link("Java")],
             )
         )
-        mock_client.get.return_value = mock_response
+        mock_api_client.get.return_value = mock_response
 
         result = await service.traverse("Python", depth=0)
 
         assert len(result.texts) == 1
         assert len(result.visited) == 1
         assert "python" in result.visited
-        mock_client.get.assert_called_once()
+        mock_api_client.get.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_traverse_depth_one_fetches_linked_articles(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         responses = {
             "Python": make_wiki_response(
@@ -140,12 +141,12 @@ class TestWikiRecursiveFetchService:
             ),
         }
 
-        async def get_response(url: str, params: dict) -> MagicMock:
+        async def get_response(params: dict) -> MagicMock:
             title = params["page"]
             json_data = responses.get(title, {"error": {"code": "missingtitle"}})
             return make_mock_response(json_data)
 
-        mock_client.get.side_effect = get_response
+        mock_api_client.get.side_effect = get_response
 
         result = await service.traverse("Python", depth=1)
 
@@ -157,7 +158,7 @@ class TestWikiRecursiveFetchService:
 
     @pytest.mark.asyncio
     async def test_traverse_avoids_revisiting_articles(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         responses = {
             "A": make_wiki_response(
@@ -172,21 +173,21 @@ class TestWikiRecursiveFetchService:
             ),
         }
 
-        async def get_response(url: str, params: dict) -> MagicMock:
+        async def get_response(params: dict) -> MagicMock:
             title = params["page"]
             json_data = responses.get(title, {"error": {"code": "missingtitle"}})
             return make_mock_response(json_data)
 
-        mock_client.get.side_effect = get_response
+        mock_api_client.get.side_effect = get_response
 
         result = await service.traverse("A", depth=2)
 
         assert len(result.texts) == 2
-        assert mock_client.get.call_count == 2
+        assert mock_api_client.get.call_count == 2
 
     @pytest.mark.asyncio
     async def test_traverse_handles_missing_pages(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         responses = {
             "A": make_wiki_response(
@@ -201,12 +202,12 @@ class TestWikiRecursiveFetchService:
             ),
         }
 
-        async def get_response(url: str, params: dict) -> MagicMock:
+        async def get_response(params: dict) -> MagicMock:
             title = params["page"]
             json_data = responses.get(title, {"error": {"code": "missingtitle"}})
             return make_mock_response(json_data)
 
-        mock_client.get.side_effect = get_response
+        mock_api_client.get.side_effect = get_response
 
         result = await service.traverse("A", depth=1)
 
@@ -247,144 +248,10 @@ class TestNormalizeTitle:
         assert result == "python"
 
 
-class TestRetryBehavior:
-    @pytest.fixture
-    def mock_client(self) -> AsyncMock:
-        return AsyncMock(spec=httpx.AsyncClient)
-
-    @pytest.fixture
-    def settings(self) -> Settings:
-        return Settings(
-            retry_max_attempts=3,
-            retry_min_wait=0.01,
-            retry_max_wait=0.1,
-            retry_multiplier=1.0,
-            retry_jitter_max=0.01,
-        )
-
-    @pytest.fixture
-    def service(
-        self, mock_client: AsyncMock, settings: Settings
-    ) -> WikiRecursiveFetchService:
-        return WikiRecursiveFetchService(client=mock_client, settings=settings)
-
-    @pytest.mark.asyncio
-    async def test_retries_on_timeout(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
-    ) -> None:
-        mock_client.get.side_effect = [
-            httpx.TimeoutException("timeout"),
-            httpx.TimeoutException("timeout"),
-            make_mock_response(make_wiki_response("Test", "<p>Content</p>", [])),
-        ]
-
-        result = await service.fetch_page("Test")
-
-        assert result is not None
-        assert result.title == "Test"
-        assert mock_client.get.call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_retries_on_connection_error(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
-    ) -> None:
-        mock_client.get.side_effect = [
-            httpx.ConnectError("connection failed"),
-            make_mock_response(make_wiki_response("Test", "<p>Content</p>", [])),
-        ]
-
-        result = await service.fetch_page("Test")
-
-        assert result is not None
-        assert mock_client.get.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_retries_on_429_rate_limit(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
-    ) -> None:
-        rate_limit_response = MagicMock()
-        rate_limit_response.status_code = 429
-        rate_limit_response.headers = {}
-
-        mock_client.get.side_effect = [
-            rate_limit_response,
-            make_mock_response(make_wiki_response("Test", "<p>Content</p>", [])),
-        ]
-
-        result = await service.fetch_page("Test")
-
-        assert result is not None
-        assert mock_client.get.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_retries_on_500_server_error(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
-    ) -> None:
-        server_error_response = MagicMock()
-        server_error_response.status_code = 500
-
-        mock_client.get.side_effect = [
-            server_error_response,
-            make_mock_response(make_wiki_response("Test", "<p>Content</p>", [])),
-        ]
-
-        result = await service.fetch_page("Test")
-
-        assert result is not None
-        assert mock_client.get.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_uses_retry_after_header(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
-    ) -> None:
-        rate_limit_response = MagicMock()
-        rate_limit_response.status_code = 429
-        rate_limit_response.headers = {"Retry-After": "0.05"}
-
-        mock_client.get.side_effect = [
-            rate_limit_response,
-            make_mock_response(make_wiki_response("Test", "<p>Content</p>", [])),
-        ]
-
-        result = await service.fetch_page("Test")
-
-        assert result is not None
-        assert mock_client.get.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_raises_after_max_retries_exceeded(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
-    ) -> None:
-        from src.exceptions import RecoverableAPIError
-
-        mock_client.get.side_effect = httpx.TimeoutException("timeout")
-
-        with pytest.raises(RecoverableAPIError, match="Timeout"):
-            await service.fetch_page("Test")
-
-        assert mock_client.get.call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_does_not_retry_on_404(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
-    ) -> None:
-        from src.exceptions import WikipediaAPIError
-
-        not_found_response = MagicMock()
-        not_found_response.status_code = 404
-
-        mock_client.get.return_value = not_found_response
-
-        with pytest.raises(WikipediaAPIError, match="404"):
-            await service.fetch_page("Test")
-
-        assert mock_client.get.call_count == 1
-
-
 class TestErrorCollection:
     @pytest.fixture
-    def mock_client(self) -> AsyncMock:
-        return AsyncMock(spec=httpx.AsyncClient)
+    def mock_api_client(self) -> AsyncMock:
+        return AsyncMock(spec=WikipediaAPIClient)
 
     @pytest.fixture
     def settings(self) -> Settings:
@@ -396,13 +263,13 @@ class TestErrorCollection:
 
     @pytest.fixture
     def service(
-        self, mock_client: AsyncMock, settings: Settings
+        self, mock_api_client: AsyncMock, settings: Settings
     ) -> WikiRecursiveFetchService:
-        return WikiRecursiveFetchService(client=mock_client, settings=settings)
+        return WikiRecursiveFetchService(api_client=mock_api_client, settings=settings)
 
     @pytest.mark.asyncio
     async def test_traverse_collects_errors_and_continues(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         responses = {
             "A": make_wiki_response(
@@ -417,14 +284,14 @@ class TestErrorCollection:
             ),
         }
 
-        async def get_response(url: str, params: dict) -> MagicMock:
+        async def get_response(params: dict) -> MagicMock:
             title = params["page"]
             if title == "B":
-                raise httpx.TimeoutException("timeout")
+                raise RecoverableAPIError("Timeout for 'B'")
             json_data = responses.get(title, {"error": {"code": "missingtitle"}})
             return make_mock_response(json_data)
 
-        mock_client.get.side_effect = get_response
+        mock_api_client.get.side_effect = get_response
 
         result = await service.traverse("A", depth=1)
 
@@ -435,7 +302,7 @@ class TestErrorCollection:
 
     @pytest.mark.asyncio
     async def test_traverse_returns_partial_results_on_errors(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         responses = {
             "A": make_wiki_response(
@@ -450,14 +317,14 @@ class TestErrorCollection:
             ),
         }
 
-        async def get_response(url: str, params: dict) -> MagicMock:
+        async def get_response(params: dict) -> MagicMock:
             title = params["page"]
             if title in ("C", "D"):
-                raise httpx.ConnectError("connection failed")
+                raise WikipediaAPIError(f"Connection failed for '{title}'")
             json_data = responses.get(title, {"error": {"code": "missingtitle"}})
             return make_mock_response(json_data)
 
-        mock_client.get.side_effect = get_response
+        mock_api_client.get.side_effect = get_response
 
         result = await service.traverse("A", depth=1)
 
@@ -468,7 +335,7 @@ class TestErrorCollection:
 
     @pytest.mark.asyncio
     async def test_traverse_empty_errors_on_success(
-        self, service: WikiRecursiveFetchService, mock_client: AsyncMock
+        self, service: WikiRecursiveFetchService, mock_api_client: AsyncMock
     ) -> None:
         mock_response = make_mock_response(
             make_wiki_response(
@@ -477,7 +344,7 @@ class TestErrorCollection:
                 links=[],
             )
         )
-        mock_client.get.return_value = mock_response
+        mock_api_client.get.return_value = mock_response
 
         result = await service.traverse("A", depth=0)
 
