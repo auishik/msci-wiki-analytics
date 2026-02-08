@@ -8,11 +8,13 @@ from fastapi.responses import JSONResponse
 from src.exceptions import WikipediaAPIError, WikipediaParseError
 from src.models.schemas import HealthResponse, KeywordsRequest, WordFrequencyResponse
 from src.services.frequency import WordFrequencyService
+from src.services.wiki_client import WikipediaAPIClient
 from src.services.wikipedia import WikiRecursiveFetchService
 
 logger = logging.getLogger(__name__)
 
 # Service instances
+api_client: WikipediaAPIClient | None = None
 wiki_service: WikiRecursiveFetchService | None = None
 frequency_service: WordFrequencyService | None = None
 
@@ -20,13 +22,14 @@ frequency_service: WordFrequencyService | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan - startup and shutdown."""
-    global wiki_service, frequency_service
-    wiki_service = WikiRecursiveFetchService()
+    global api_client, wiki_service, frequency_service
+    api_client = WikipediaAPIClient()
+    wiki_service = WikiRecursiveFetchService(api_client=api_client)
     frequency_service = WordFrequencyService()
     logger.info("Services initialized")
     yield
-    if wiki_service:
-        await wiki_service.close()
+    if api_client:
+        await api_client.close()
     logger.info("Services shut down")
 
 
