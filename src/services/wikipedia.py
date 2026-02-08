@@ -85,7 +85,12 @@ class WikiRecursiveFetchService:
                     "User-Agent": self._settings.wiki_user_agent,
                     "Api-User-Agent": self._settings.wiki_user_agent,
                 },
-                timeout=self._settings.request_timeout,
+                timeout=httpx.Timeout(
+                    connect=self._settings.timeout_connect,
+                    read=self._settings.timeout_read,
+                    write=self._settings.timeout_write,
+                    pool=self._settings.timeout_pool,
+                ),
             )
         return self._client
 

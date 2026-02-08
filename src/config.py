@@ -18,8 +18,11 @@ class Settings(BaseSettings):
     max_concurrent_requests: int = 10
     max_requests_per_second: float = 5.0
 
-    # HTTP client settings
-    request_timeout: float = 30.0
+    # HTTP timeout settings (seconds)
+    timeout_connect: float = 10.0
+    timeout_read: float = 30.0
+    timeout_write: float = 10.0
+    timeout_pool: float = 120.0
 
     # Retry settings
     retry_max_attempts: int = 3
