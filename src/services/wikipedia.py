@@ -2,18 +2,43 @@ import asyncio
 import json
 import logging
 import re
-from functools import partial
+import time
 from urllib.parse import unquote
 
-import aiometer
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from pydantic import BaseModel, Field
 
 from src.config import Settings, get_settings
-from src.exceptions import WikipediaFetchError, WikipediaParseError
+from src.exceptions import WikipediaAPIError, WikipediaFetchError, WikipediaParseError
 from src.services.wiki_client import WikipediaAPIClient
+from src.services.wiki_html_client import WikiHTMLClient
 
 logger = logging.getLogger(__name__)
+
+
+class RateLimiter:
+    """Rate limiter using semaphore for concurrency and token bucket for rate."""
+
+    def __init__(self, max_concurrent: int, max_per_second: float) -> None:
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._max_per_second = max_per_second
+        self._min_interval = 1.0 / max_per_second
+        self._last_request_time: float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Acquire permission to make a request."""
+        await self._semaphore.acquire()
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < self._min_interval:
+                await asyncio.sleep(self._min_interval - elapsed)
+            self._last_request_time = time.monotonic()
+
+    def release(self) -> None:
+        """Release the semaphore after request completes."""
+        self._semaphore.release()
 
 
 class PageContent(BaseModel):
@@ -45,20 +70,30 @@ class WikiRecursiveFetchService:
     def __init__(
         self,
         api_client: WikipediaAPIClient | None = None,
+        html_client: WikiHTMLClient | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._settings = settings or get_settings()
-        self._api_client = api_client or WikipediaAPIClient(settings=self._settings)
-        self._owns_client = api_client is None
+        self._api_client = api_client
+        self._html_client = html_client
+        self._owned_client: WikipediaAPIClient | WikiHTMLClient | None = None
+
+        # Default to HTML client to avoid API rate limiting
+        if api_client is None and html_client is None:
+            self._html_client = WikiHTMLClient(settings=self._settings)
+            self._owned_client = self._html_client
 
     async def close(self) -> None:
-        """Close the API client if we own it."""
-        if self._owns_client:
-            await self._api_client.close()
+        """Close the client if we own it."""
+        if self._owned_client is not None:
+            await self._owned_client.close()
 
     async def fetch_page(self, title: str) -> PageContent | None:
         """
         Fetch a Wikipedia page's content and links.
+
+        Dispatches to the HTML client (plain GET) or API client depending
+        on which was configured.
 
         Args:
             title: The title of the Wikipedia article.
@@ -67,10 +102,121 @@ class WikiRecursiveFetchService:
             PageContent with text and links, or None if page not found.
 
         Raises:
-            WikipediaAPIError: If the API request fails after retries.
+            WikipediaAPIError: If the request fails after retries.
             WikipediaParseError: If unable to parse the response.
         """
-        logger.debug("Fetching page: %s", title)
+        if self._html_client is not None:
+            return await self._fetch_page_html(title)
+        if self._api_client is not None:
+            return await self._fetch_page_api(title)
+        raise RuntimeError("No client configured")
+
+    # ------------------------------------------------------------------
+    # HTML client path (plain GET to /wiki/<title>)
+    # ------------------------------------------------------------------
+
+    async def _fetch_page_html(self, title: str) -> PageContent | None:
+        """Fetch a Wikipedia page by downloading its HTML directly."""
+        assert self._html_client is not None
+        logger.debug("Fetching page (HTML): %s", title)
+
+        try:
+            response = await self._html_client.get(title)
+        except WikipediaAPIError as e:
+            if e.status_code == 404:
+                logger.warning("Page not found: %s", title)
+                return None
+            raise
+
+        html = response.text
+        soup = BeautifulSoup(html, "lxml")
+
+        # Extract page title from the heading
+        h1 = soup.find("h1", {"id": "firstHeading"})
+        page_title = h1.get_text(strip=True) if isinstance(h1, Tag) else title
+
+        # Scope to the parser-output content div
+        content_div = soup.find("div", class_="mw-parser-output")
+        if not isinstance(content_div, Tag):
+            logger.warning("No content div found for page: %s", title)
+            return None
+
+        # Extract links *before* decomposing elements
+        links = self._extract_links_from_html(content_div)
+
+        # Remove unwanted elements for text extraction
+        for element in content_div.find_all(["script", "style", "table", "sup"]):
+            element.decompose()
+        for element in content_div.find_all(
+            class_=[
+                "navbox",
+                "sidebar",
+                "metadata",
+                "mw-editsection",
+                "reference",
+                "toc",
+                "catlinks",
+            ]
+        ):
+            element.decompose()
+
+        text = content_div.get_text(separator=" ", strip=True)
+        text = self._clean_text(text)
+
+        logger.debug(
+            "Fetched page '%s' (HTML): %d chars, %d links",
+            page_title,
+            len(text),
+            len(links),
+        )
+        return PageContent(
+            title=page_title,
+            text=text,
+            links=links,
+        )
+
+    def _extract_links_from_html(self, content_div: Tag) -> list[str]:
+        """Extract internal Wikipedia article links from HTML content."""
+        links: list[str] = []
+        seen: set[str] = set()
+
+        for a_tag in content_div.find_all("a", href=True):
+            href = a_tag["href"]
+            if not isinstance(href, str) or not href.startswith("/wiki/"):
+                continue
+
+            # Strip /wiki/ prefix
+            article_path = href[6:]
+
+            # Remove fragment
+            if "#" in article_path:
+                article_path = article_path.split("#")[0]
+
+            if not article_path:
+                continue
+
+            # Skip namespace pages (File:, Wikipedia:, Help:, etc.)
+            if ":" in unquote(article_path):
+                continue
+
+            # Decode and normalize
+            title = unquote(article_path).replace("_", " ")
+            normalized = title.lower()
+
+            if normalized not in seen:
+                seen.add(normalized)
+                links.append(title)
+
+        return links
+
+    # ------------------------------------------------------------------
+    # API client path (MediaWiki API /w/api.php)
+    # ------------------------------------------------------------------
+
+    async def _fetch_page_api(self, title: str) -> PageContent | None:
+        """Fetch a Wikipedia page via the MediaWiki API."""
+        assert self._api_client is not None
+        logger.debug("Fetching page (API): %s", title)
 
         params = {
             "action": "parse",
@@ -122,7 +268,7 @@ class WikiRecursiveFetchService:
             ) from e
 
         logger.debug(
-            "Fetched page '%s': %d chars, %d links",
+            "Fetched page '%s' (API): %d chars, %d links",
             title,
             len(text),
             len(links),
@@ -161,7 +307,11 @@ class WikiRecursiveFetchService:
         """
         logger.info("Starting traversal from '%s' with depth %d", title, depth)
         result = TraversalResult()
-        await self._traverse_recursive(title, depth, result)
+        rate_limiter = RateLimiter(
+            max_concurrent=self._settings.max_concurrent_requests,
+            max_per_second=self._settings.max_requests_per_second,
+        )
+        await self._traverse_recursive(title, depth, result, rate_limiter)
         logger.info(
             "Traversal complete: %d articles fetched, %d visited, %d errors",
             len(result.texts),
@@ -175,6 +325,7 @@ class WikiRecursiveFetchService:
         title: str,
         depth: int,
         result: TraversalResult,
+        rate_limiter: RateLimiter,
     ) -> None:
         """Recursively traverse Wikipedia articles."""
         normalized_title = self._normalize_title(title)
@@ -184,12 +335,15 @@ class WikiRecursiveFetchService:
 
         result.visited.add(normalized_title)
 
+        await rate_limiter.acquire()
         try:
             page = await self.fetch_page(title)
         except WikipediaFetchError as e:
             logger.warning("Failed to fetch '%s': %s", title, e)
             result.errors.append(TraversalError(title=title, error=str(e)))
             return
+        finally:
+            rate_limiter.release()
 
         if page is None:
             return
@@ -199,14 +353,13 @@ class WikiRecursiveFetchService:
         if depth <= 0:
             return
 
-        # Traverse linked articles with rate limiting
+        # Traverse linked articles concurrently with shared rate limiter
         if page.links:
-            await aiometer.run_on_each(
-                partial(self._traverse_recursive, depth=depth - 1, result=result),
-                page.links,
-                max_at_once=self._settings.max_concurrent_requests,
-                max_per_second=self._settings.max_requests_per_second,
-            )
+            tasks = [
+                self._traverse_recursive(link, depth - 1, result, rate_limiter)
+                for link in page.links
+            ]
+            await asyncio.gather(*tasks)
 
 
 async def _main() -> None:

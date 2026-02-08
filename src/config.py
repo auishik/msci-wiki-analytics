@@ -8,6 +8,9 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(extra="ignore")
 
+    # Logging settings
+    log_level: str = "INFO"
+
     # Wikipedia API settings
     wiki_user_agent: str = (
         "msci-wiki-analytics/0.1.0 "
@@ -15,7 +18,7 @@ class Settings(BaseSettings):
     )
 
     # Rate limiting settings
-    max_concurrent_requests: int = 10
+    max_concurrent_requests: int = 60
     max_requests_per_second: float = 5.0
 
     # HTTP timeout settings (seconds)
