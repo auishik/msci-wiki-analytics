@@ -248,6 +248,19 @@ class TestNormalizeTitle:
         result = service._normalize_title("PYTHON")
         assert result == "python"
 
+    def test_normalizes_unicode_forms(self) -> None:
+        """Precomposed and decomposed Unicode should normalize to the same value."""
+        service = WikiRecursiveFetchService()
+        # Precomposed: ñ is U+00F1 (single character)
+        precomposed = "Ñāṇamoli Bhikkhu"
+        # Decomposed: ñ is U+004E + U+0303 (N + combining tilde)
+        decomposed = "N\u0303a\u0304n\u0323amoli Bhikkhu"
+
+        result_precomposed = service._normalize_title(precomposed)
+        result_decomposed = service._normalize_title(decomposed)
+
+        assert result_precomposed == result_decomposed
+
 
 class TestErrorCollection:
     @pytest.fixture
