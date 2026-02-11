@@ -382,7 +382,7 @@ class WikiRecursiveFetchService:
             return
 
         result.visited.add(normalized_title)
-        logger.info(f"Added visited: $${title}$$ $${normalized_title}$$")
+        logger.info(f'Added visited: "{title=}" "{normalized_title=}"')
 
         await rate_limiter.acquire()
         try:
