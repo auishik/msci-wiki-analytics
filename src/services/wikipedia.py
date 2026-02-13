@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from urllib.parse import unquote
 
 from bs4 import BeautifulSoup, Tag
@@ -338,6 +339,7 @@ class WikiRecursiveFetchService:
         """Normalize a Wikipedia title for comparison."""
         title = unquote(title)
         title = title.replace("_", " ")
+        title = unicodedata.normalize("NFC", title)
         return title.strip().lower()
 
     async def traverse(self, title: str, depth: int) -> TraversalResult:
@@ -380,6 +382,7 @@ class WikiRecursiveFetchService:
             return
 
         result.visited.add(normalized_title)
+        logger.info(f'Added visited: "{title=}" "{normalized_title=}"')
 
         await rate_limiter.acquire()
         try:
